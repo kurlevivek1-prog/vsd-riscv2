@@ -1,1 +1,203 @@
 
+Task-4: Timer IP — Real Peripheral IP Development
+
+VSDSquadron RISC-V FPGA Program
+Core Contributor Task — Timer IP
+Board: VSDSquadron FPGA Mini (Lattice iCE40 UP5K)
+
+
+What This Does
+A 32-bit programmable countdown timer peripheral integrated into the FemtoRV32 RISC-V SoC.
+
+CPU writes a countdown value into the LOAD register
+CPU sets EN=1 in CTRL to start counting
+Hardware decrements VALUE every clock cycle
+When VALUE hits 0 → TIMEOUT flag is set in STATUS
+CPU polls STATUS, sees TIMEOUT=1, clears it, toggles an LED
+In periodic mode it auto-reloads and repeats forever
+
+
+Repository Structure
+ip/timer_ip/
+├── rtl/
+│   └── timer_ip.v          ← Timer IP Verilog module
+├── test/
+│   ├── timer_test.c        ← C simulation test program
+│   └── timer_blink.c       ← C hardware LED blink program
+└── README.md
+
+Register Map
+Base Address: 0x400040
+
+Address calculation:
+isIO = mem_addr[22] = 1 → 0x400000
+mem_wordaddr[4] = mem_addr[6] = 1 → 0x000040
+Total = 0x400040
+
+OffsetNameR/WDescription0x00CTRLR/WBit0=EN, Bit1=MODE, Bit2=PRESC_EN, Bits[15:8]=PRESC_DIV0x04LOADR/WCountdown start value (32-bit)0x08VALUERCurrent countdown value (read-only)0x0CSTATUSR/WBit0=TIMEOUT (write 1 to clear)
+CTRL Register Bits
+BitNameDescription0EN1 = enable counting, 0 = stop1MODE0 = one-shot, 1 = periodic auto-reload2PRESC_EN1 = enable prescaler[15:8]PRESC_DIVPrescaler divide value (divides by PRESC_DIV+1)
+
+How to Use (Software)
+c#define TIMER_BASE   0x400040
+#define TIMER_CTRL   (*((volatile uint32_t *)(TIMER_BASE + 0x00)))
+#define TIMER_LOAD   (*((volatile uint32_t *)(TIMER_BASE + 0x04)))
+#define TIMER_VALUE  (*((volatile uint32_t *)(TIMER_BASE + 0x08)))
+#define TIMER_STATUS (*((volatile uint32_t *)(TIMER_BASE + 0x0C)))
+
+// One-shot mode — count down from 100
+TIMER_LOAD = 100;
+TIMER_CTRL = 0x01;                   // EN=1, one-shot
+while (!(TIMER_STATUS & 1));         // poll TIMEOUT
+TIMER_STATUS = 1;                    // clear TIMEOUT
+TIMER_CTRL = 0;                      // stop
+
+// Periodic mode — toggle LED every 10 seconds
+// 12MHz / 256 prescaler = 46875 ticks/sec
+// 46875 x 10 = 468750
+TIMER_LOAD = 468750;
+TIMER_CTRL = (255 << 8) | (1<<2) | (1<<1) | (1<<0);  // PRESC_DIV=255, PRESC_EN, MODE, EN
+while (1) {
+    while (!(TIMER_STATUS & 1));     // wait for TIMEOUT
+    TIMER_STATUS = 1;                // clear
+    // toggle LED here
+}
+
+RTL Module — timer_ip.v
+Module Ports
+PortDirectionWidthDescriptionclkinput1System clockrstinput1Active high resetvalidinput1isIO & mem_wordaddr[IO_TIMER_bit]weinput1Write enable (mem_wstrb)offsetinput2Register select (mem_addr[3:2])wdatainput32Data from CPUrdataoutput32Data to CPU
+Key Design Decisions
+
+valid is qualified with Timer address bit — fires only on Timer accesses
+Writing EN=1 to CTRL simultaneously loads VALUE from LOAD register
+TIMEOUT sets when VALUE==1 (one cycle before hitting 0)
+Write-1-to-clear on STATUS bit 0
+Prescaler counter resets when disabled or timer is stopped
+Single always block used to avoid driver conflicts
+
+
+SoC Integration — 3 Changes to riscv.v
+Change 1 — Address Constant
+veriloglocalparam IO_TIMER_bit = 4;   // after existing IO constants
+Change 2 — Module Instance
+verilogwire [31:0] timer_rdata;
+timer_ip TIMER(
+   .clk(clk),
+   .rst(!resetn),
+   .valid(isIO & mem_wordaddr[IO_TIMER_bit]),
+   .we(mem_wstrb),
+   .offset(mem_addr[3:2]),
+   .wdata(mem_wdata),
+   .rdata(timer_rdata)
+);
+Change 3 — Readback Mux
+verilogwire [31:0] IO_rdata =
+    mem_wordaddr[IO_UART_CNTL_bit] ? {22'b0, !uart_ready, 9'b0} :
+    mem_wordaddr[IO_GPIO_bit]      ? gpio_rdata                  :
+    mem_wordaddr[IO_TIMER_bit]     ? timer_rdata                 :
+                                     32'b0;
+
+Step-by-Step: Run Simulation
+Step 1 — Clone and navigate
+bashgit clone <your-repo-url>
+cd vsdfpga_labs/basicRISCV
+Step 2 — Compile RTL
+bashcd RTL
+iverilog -o test_timer -DBENCH riscv.v timer_ip.v gpio_out_v2.v ice40_primitives.v
+Expected output: no errors
+Step 3 — Build firmware
+bashcd ../Firmware
+make timer_test.bram.hex
+Expected output:
+Code size: 756 words ( total RAM size: 1536 words )
+Occupancy: 49%
+Step 4 — Run simulation
+bashcd ../RTL
+vvp test_timer
+Expected output:
+=== Test 1: One-shot mode ===
+Timer started. Load=100
+Waiting for TIMEOUT...
+TIMEOUT! VALUE=0
+TIMEOUT cleared. STATUS=0
+
+=== Test 2: Periodic mode (3 timeouts) ===
+Timeout #1! VALUE=36
+Timeout #2! VALUE=39
+Timeout #3! VALUE=42
+
+ALL TESTS DONE
+Simulation Results
+TestResultProofOne-shot TIMEOUTVALUE=0 ✅Timer counted to 0 and set flagSTATUS clearedSTATUS=0 ✅Write-1-to-clear worksPeriodic timeout #1VALUE=36 ✅Auto-reload workingPeriodic timeout #2VALUE=39 ✅Continuous counting confirmedPeriodic timeout #3VALUE=42 ✅3 timeouts — periodic mode proven
+
+Step-by-Step: Run on Hardware
+Requirements
+
+VSDSquadron FPGA Mini board (iCE40 UP5K)
+FTDI USB cable (for flashing)
+CH340G USB-to-Serial (for UART output)
+Ubuntu Linux with OSS CAD Suite installed
+
+Wiring for UART (CH340G)
+VSDSquadron FM Board    CH340G Module
+──────────────────────────────────────
+Pin 4  (TXD)       →    RXD
+Pin 3  (RXD)       →    TXD
+GND                →    GND
+Step 1 — Build firmware
+bashcd Firmware
+make timer_blink.bram.hex
+cp timer_blink.bram.hex ../RTL/firmware.hex
+echo "timer_blink.bram.hex" > ../RTL/firmware.txt
+Step 2 — Verify timestamps before building
+bashls -la ../RTL/firmware.hex ../RTL/SOC.bin
+
+firmware.hex must be newer than SOC.bin
+
+Step 3 — Build FPGA bitstream
+bashcd ../RTL
+make build
+Expected output includes:
+// Timing estimate: ~58 ns (17 MHz)
+icepack -s SOC.asc SOC.bin
+Step 4 — Flash to board
+bashmake flash
+Expected output:
+init..
+cdone: high
+reset..
+cdone: low
+flash ID: 0xEF 0x40 0x16 0x00
+programming..
+done.
+reading..
+VERIFY OK
+cdone: high
+Bye.
+Step 5 — Open UART terminal
+bashpicocom -b 9600 /dev/ttyUSB1 --imap lfcrlf,crcrlf --omap delbs,crlf
+Press RESET on board. Expected UART output:
+================================
+  Task-4: Timer IP Hardware Demo
+  VSDSquadron FPGA Mini
+================================
+TIMER_LOAD written: 468750
+TIMER_CTRL written: EN=1 MODE=periodic PRESC=255
+LED ON - waiting for first timeout...
+================================
+TIMEOUT #1 -> LED OFF
+TIMEOUT #2 -> LED ON
+TIMEOUT #3 -> LED OFF
+Hardware LED Behavior
+TimeLED StateEvent0sON  🔴Timer started, firmware running10sOFF ⚫TIMEOUT #1 — Timer IP triggered20sON  🔴TIMEOUT #2 — Periodic auto-reload30sOFF ⚫TIMEOUT #3 — Continues forever
+
+Count 10 seconds yourself — if LED toggles exactly at 10s, Timer IP is working correctly on real hardware ✅
+
+
+Debugging Tips
+ProblemCauseFixSimulation stuck at "Waiting for TIMEOUT..."Wrong TIMER_BASE addressUse 0x400040 not 0x400010LED never blinks after flashRESET pin floatingTie RESET to 1'b0 in ClockworksLED ON but no UART outputUART ready bit invertedUse while (UART_CNTL & (1<<9)) not !(...)Driver conflict warning in yosysTwo always blocks driving status_regUse single always block in timer_ip.vfirmware not embedded in SOC.binfirmware.hex older than SOC.binAlways cp hex file then make build
+
+Tools Used
+ToolVersionPurposeGitHub Codespaces—Cloud development environmentOSS CAD SuitelatestRISC-V + FPGA toolchainriscv64-unknown-elf-gcc—RISC-V C compiler (rv32i)Icarus Verilog (iverilog)—Verilog simulationvvp—Simulation runtimeYosys—FPGA synthesisnextpnr-ice40—Place and routeiceprog—Flash programmerpicocom—UART terminalVSDSquadron FPGA MiniiCE40 UP5KTarget hardware board
+
+VSDSquadron RISC-V FPGA Program — Task-4 Timer IP Complete ✅
